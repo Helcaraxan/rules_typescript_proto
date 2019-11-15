@@ -14,20 +14,23 @@ TypescriptProtoLibraryAspect = provider(
 
 def _proto_path(proto):
     """
-    The proto path is not really a file path
-    It's the path to the proto that was seen when the descriptor file was generated.
+    The proto path is not really a file path. It's the path to the proto that was seen when the
+    descriptor file was generated. It takes into account any stripped or added prefixes part of the
+    declaring proto_library rule.
     """
     path = proto.path
     root = proto.root.path
     ws = proto.owner.workspace_root
+    virt_prefix = "_virtual_imports/" + proto.owner.name
+    if proto.owner.package:
+        virt_prefix = proto.owner.package + "/" + virt_prefix
+
     if path.startswith(root):
-        path = path[len(root):]
-    if path.startswith("/"):
-        path = path[1:]
+        path = path[len(root):].strip("/")
     if path.startswith(ws):
-        path = path[len(ws):]
-    if path.startswith("/"):
-        path = path[1:]
+        path = path[len(ws):].strip("/")
+    if path.startswith(virt_prefix):
+        path = path[len(virt_prefix):].strip("/")
     return path
 
 def _get_protoc_inputs(target, ctx):
@@ -48,14 +51,36 @@ def _get_input_proto_names(target):
         proto_inputs.append(normalized_file)
     return " ".join(proto_inputs)
 
-def _build_protoc_command(target, ctx):
+def _build_output_dir_command(target, ctx):
+    """
+    Output for JS & TS generation should stored into a specifically created directory within the
+    current package's binary directory. The directory is named after the generating rule (usually
+    'native_proto_library%').
+    """
+    output_path_elems = [
+        ctx.var["BINDIR"].rstrip("/"),
+    ]
+    if ctx.label.workspace_root != "__main__":
+        output_path_elems = output_path_elems + [
+            ctx.label.workspace_root,
+        ]
+    output_path_elems = output_path_elems + [
+        ctx.label.package,
+        ctx.label.name + "%",
+    ]
+    output_path = "/".join([p for p in output_path_elems if p])
+
+    mkdir_cmd = 'mkdir -p "%s"'%(output_path)
+    output_dir = ctx.actions.declare_directory(ctx.label.name + "%")
+    return output_dir, mkdir_cmd
+
+def _build_protoc_command(target, output_dir, ctx):
     protoc_command = "%s" % (ctx.file._protoc.path)
 
     protoc_command += " --plugin=protoc-gen-ts=%s" % (ctx.files._ts_protoc_gen[1].path)
 
-    protoc_output_dir = ctx.var["BINDIR"]
-    protoc_command += " --ts_out=service=grpc-web:%s" % (protoc_output_dir)
-    protoc_command += " --js_out=import_style=commonjs,binary:%s" % (protoc_output_dir)
+    protoc_command += " --ts_out=service=grpc-web:%s" % (output_dir.path)
+    protoc_command += " --js_out=import_style=commonjs,binary:%s" % (output_dir.path)
 
     descriptor_sets_paths = [desc.path for desc in target[ProtoInfo].transitive_descriptor_sets.to_list()]
     protoc_command += " --descriptor_set_in=%s" % (":".join(descriptor_sets_paths))
@@ -72,15 +97,11 @@ def _create_post_process_command(target, ctx, js_outputs, js_outputs_es6):
     """
     convert_commands = []
     for [output, output_es6] in zip(js_outputs, js_outputs_es6):
-        file_path = "/".join([p for p in [
-            ctx.workspace_name,
-            ctx.label.package,
-        ] if p])
         file_name = output.basename[:-len(output.extension) - 1]
 
         convert_command = ctx.files._change_import_style[1].path
-        convert_command += " --workspace_name {}".format(ctx.workspace_name)
-        convert_command += " --input_base_path {}".format(file_path)
+        convert_command += " --workspace_name {}".format(ctx.workspace_name.replace("__main__", ""))
+        convert_command += " --input_base_path {}".format(ctx.label.package)
         convert_command += " --output_module_name {}".format(file_name)
         convert_command += " --input_file_path {}".format(output.path)
         convert_command += " --output_umd_path {}".format(output.path)
@@ -97,16 +118,22 @@ def _get_outputs(target, ctx):
     js_outputs_es6 = []
     dts_outputs = []
     for src in target[ProtoInfo].direct_sources:
-        file_name = src.basename[:-len(src.extension) - 1]
+        base_path = "/".join([p for p in [
+            ctx.label.name + "%",
+            _proto_path(src)[:-len(src.basename)-1],
+            src.basename[:-len(src.extension) - 1],
+        ] if p])
+
         for f in ["_pb", "_pb_service"]:
-            full_name = file_name + f
-            output = ctx.actions.declare_file(full_name + ".js")
+            full_path = base_path + f
+            output = ctx.actions.declare_file(full_path + ".js")
             js_outputs.append(output)
-            output_es6 = ctx.actions.declare_file(full_name + ".mjs")
+            output_es6 = ctx.actions.declare_file(full_path + ".mjs")
             js_outputs_es6.append(output_es6)
 
         for f in ["_pb.d.ts", "_pb_service.d.ts"]:
-            output = ctx.actions.declare_file(file_name + f)
+            full_path = base_path + f
+            output = ctx.actions.declare_file(full_path)
             dts_outputs.append(output)
 
     return [js_outputs, js_outputs_es6, dts_outputs]
@@ -119,11 +146,14 @@ def typescript_proto_library_aspect_(target, ctx):
     Handles running protoc to produce the generated JS and TS files.
     """
 
+    output_dir, mk_output_dir_cmd = _build_output_dir_command(target, ctx)
+
     [js_outputs, js_outputs_es6, dts_outputs] = _get_outputs(target, ctx)
-    protoc_outputs = dts_outputs + js_outputs + js_outputs_es6
+    protoc_outputs = [output_dir] + dts_outputs + js_outputs + js_outputs_es6
 
     all_commands = [
-        _build_protoc_command(target, ctx),
+        mk_output_dir_cmd,
+        _build_protoc_command(target, output_dir, ctx),
         _create_post_process_command(target, ctx, js_outputs, js_outputs_es6),
     ]
 
@@ -166,7 +196,6 @@ def typescript_proto_library_aspect_(target, ctx):
     )]
 
 typescript_proto_library_aspect = aspect(
-    implementation = typescript_proto_library_aspect_,
     attr_aspects = ["deps"],
     attrs = {
         "_ts_protoc_gen": attr.label(
@@ -188,6 +217,7 @@ typescript_proto_library_aspect = aspect(
             default = Label("//src:change_import_style"),
         ),
     },
+    implementation = typescript_proto_library_aspect_,
 )
 
 def _typescript_proto_library_impl(ctx):

@@ -29,10 +29,8 @@ function replaceRecursiveFilePaths(args: any) {
   };
 }
 
-function removeJsExtensionsFromRequires(contents: string) {
-  return contents.replace(/(require\(.*).js/g, (_, captureGroup: string) => {
-    return captureGroup;
-  });
+function removeJsExtensionsAndMainPrefixesFromRequires(contents: string) {
+  return contents.replace(/(require\(')(__main__\/)?(.*).js/g, '$1$3');
 }
 
 function convertToUmd(args: any, initialContents: string): string {
@@ -55,7 +53,7 @@ function convertToUmd(args: any, initialContents: string): string {
   const transformations: ((c: string) => string)[] = [
     wrapInAMDModule,
     replaceRecursiveFilePaths(args),
-    removeJsExtensionsFromRequires,
+    removeJsExtensionsAndMainPrefixesFromRequires,
   ];
   return transformations.reduce((currentContents, transform) => {
     return transform(currentContents);
@@ -81,7 +79,7 @@ function processCommonJs(args: any, initialContents: string): string {
 
   const transformations: ((c: string) => string)[] = [
     replaceRecursiveFilePaths(args),
-    removeJsExtensionsFromRequires,
+    removeJsExtensionsAndMainPrefixesFromRequires,
     replaceGoogExtendWithExports,
   ];
   return transformations.reduce((currentContents, transform) => {
